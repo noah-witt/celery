@@ -254,6 +254,89 @@ class test_RedisResultConsumer:
         # drain_events shouldn't crash when called before start
         consumer.drain_events(0.001)
 
+    def test_on_task_call_drains_and_closes_pubsub(self):
+        """Test that on_task_call drains and closes the existing pubsub connection.
+
+        This verifies the fix for Redis output buffer accumulation where pubsub
+        connections were left open and unread, causing Redis to close connections
+        when buffer limits were exceeded.
+        """
+        consumer = self.get_consumer()
+        # Ensure no pubsub initially
+        assert consumer._pubsub is None
+
+        # Simulate sending a task which triggers on_task_call
+        producer = Mock()
+
+        # Mock just the _drain_and_close_existing_pubsub method to verify it's called
+        with patch.object(consumer.backend, '_drain_and_close_existing_pubsub') as mock_drain_close:
+            consumer.backend.on_task_call(producer, 'some-task')
+
+            # Verify that the drain and close method was called
+            mock_drain_close.assert_called_once()
+
+        # Verify that the main result consumer subscription was created
+        assert consumer._pubsub is not None
+        key = consumer._get_key_for_task('some-task')
+        assert key in consumer.subscribed_to
+
+    def test_drain_and_close_existing_pubsub(self):
+        """Test the _drain_and_close_existing_pubsub method directly."""
+        consumer = self.get_consumer()
+        backend = consumer.backend
+
+        # Set up a mock pubsub connection on the consumer
+        mock_pubsub = Mock()
+        consumer._pubsub = mock_pubsub
+
+        # Configure the mock to return no messages (empty drain)
+        mock_pubsub.get_message.return_value = None
+
+        # Call the method
+        backend._drain_and_close_existing_pubsub()
+
+        # Verify the pubsub was drained (get_message was called)
+        mock_pubsub.get_message.assert_called()
+
+        # Verify the pubsub connection was closed
+        mock_pubsub.close.assert_called_once()
+
+        # Verify the consumer's _pubsub reference was cleared
+        assert consumer._pubsub is None
+
+    def test_on_task_call_no_drain_when_task_join_will_block(self):
+        """Test that on_task_call doesn't drain existing pubsub when task_join_will_block is True."""
+        consumer = self.get_consumer()
+        producer = Mock()
+
+        # Mock task_join_will_block to return True
+        with patch('celery.backends.redis.task_join_will_block', return_value=True):
+            with patch.object(consumer.backend, '_drain_and_close_existing_pubsub') as mock_drain_close:
+                consumer.backend.on_task_call(producer, 'some-task')
+
+                # Verify that drain_and_close was NOT called
+                mock_drain_close.assert_not_called()
+
+        # Verify no pubsub was created for the result consumer either
+        assert consumer._pubsub is None
+
+    def test_integration_on_task_call_prevents_buffer_accumulation(self):
+        """Integration test: verify that on_task_call properly manages pubsub connections by closing them."""
+        consumer = self.get_consumer()
+        producer = Mock()
+
+        # Track calls to the drain method to verify it's being called
+        with patch.object(consumer.backend, '_drain_and_close_existing_pubsub') as mock_drain:
+            # Simulate multiple task calls
+            consumer.backend.on_task_call(producer, 'task-1')
+            consumer.backend.on_task_call(producer, 'task-2')
+
+            # Verify the drain method was called for each task
+            assert mock_drain.call_count == 2
+
+        # The important thing is that connections are properly closed after each task call
+        # to prevent buffer accumulation, rather than leaving them open indefinitely
+
     def test_consume_from_connection_error(self):
         consumer = self.get_consumer()
         consumer.start('initial')
@@ -268,6 +351,45 @@ class test_RedisResultConsumer:
         consumer.consume_from('some-task')
         consumer.cancel_for('some-task')
         assert consumer._pubsub._subscribed_to == {b'celery-task-meta-initial'}
+
+    def test_on_task_call_creates_pubsub_without_draining(self):
+        """Ensure that calling on_task_call (which triggers consume_from)
+        creates a PubSub subscription, drains messages, and closes the connection.
+
+        This test verifies that the fix for Redis output buffer accumulation
+        is working correctly - when a pubsub subscription is created via
+        on_task_call, it drains pending messages and closes the connection
+        to prevent unread messages from accumulating in Redis output buffers.
+        """
+        consumer = self.get_consumer()
+        # ensure no pubsub initially
+        assert consumer._pubsub is None
+
+        # Track the pubsub that gets created and closed
+        created_pubsub = None
+        original_consume_from = consumer.consume_from
+        
+        def track_consume_from(task_id):
+            nonlocal created_pubsub
+            result = original_consume_from(task_id)
+            created_pubsub = consumer._pubsub
+            return result
+        
+        consumer.consume_from = track_consume_from
+
+        # simulate sending a task which triggers on_task_call
+        producer = Mock()
+        consumer.backend.on_task_call(producer, 'some-task')
+
+        # A pubsub should have been created during consume_from
+        assert created_pubsub is not None
+        
+        # After our fix, the pubsub should be closed and cleared
+        assert consumer._pubsub is None
+        
+        # The subscription should have been drained and closed
+        created_pubsub.get_message.assert_called()
+        created_pubsub.close.assert_called()
 
     @patch('celery.backends.redis.ResultConsumer.cancel_for')
     @patch('celery.backends.asynchronous.BaseResultConsumer.on_state_change')

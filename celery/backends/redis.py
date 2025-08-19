@@ -377,6 +377,37 @@ class RedisBackend(BaseKeyValueStoreBackend, AsyncBackendMixin):
     def on_task_call(self, producer, task_id):
         if not task_join_will_block():
             self.result_consumer.consume_from(task_id)
+            # Immediately drain and close the existing pubsub to prevent Redis output
+            # buffer accumulation when connections are left unread
+            self._drain_and_close_existing_pubsub()
+
+    def _drain_and_close_existing_pubsub(self):
+        """Drain pending messages from existing pubsub connection and close it.
+
+        This prevents Redis output buffer accumulation by ensuring that any
+        published result messages are consumed and the connection is properly closed.
+        """
+        if self.result_consumer._pubsub is not None:
+            try:
+                # Drain any pending messages with a very short timeout
+                # Limit to a reasonable number of messages to prevent infinite loops
+                max_messages = 10
+                for _ in range(max_messages):
+                    try:
+                        message = self.result_consumer._pubsub.get_message(timeout=0.001)
+                        if not message:
+                            break  # No more messages
+                    except Exception:
+                        # Ignore any errors during draining (e.g., timeout, connection issues)
+                        break
+            finally:
+                # Always close the pubsub connection to prevent dangling connections
+                try:
+                    self.result_consumer._pubsub.close()
+                    self.result_consumer._pubsub = None
+                except Exception:
+                    # Ignore errors during close
+                    pass
 
     def get(self, key):
         return self.client.get(key)
